@@ -1,0 +1,75 @@
+# File: configs/default.yaml (V11.0: Physico-Semantic & Risk-Seeking Optimized)
+
+model:
+  # BERT encoder
+  bert_path: "/home/610-sty/huggingface/bert-base-chinese"
+  hidden_size: 768
+  # Layout decoder
+  bb_size: 128            
+  decoder_layers: 6
+  decoder_heads: 8
+  dropout: 0.3
+  # Output
+  num_classes: 9
+  
+  # === CVAE Parameters ===
+  latent_dim: 64          
+
+  # === LOSS WEIGHTS (SUPERVISED STAGE 1) ===
+  # 第一阶段预训练还是用保守的参数，打好基础
+  reg_loss_weight: 1.0      
+  iou_loss_weight: 1.0      
+  area_loss_weight: 1.0     
+  
+  relation_loss_weight: 5.0 
+  overlap_loss_weight: 3.0   
+  size_loss_weight: 2.0     
+  
+  clustering_loss_weight: 1.0
+  consistency_loss_weight: 2.0 
+  gestalt_reg_loss_weight: 0.5
+
+  # Inference
+  max_elements: 30
+  
+  # Data paths
+  xlsx_path: "/home/610-sty/layout2paint/dataset/6800poems.xlsx"
+  images_dir: "/home/610-sty/layout2paint/dataset/6800"
+  labels_dir: "/home/610-sty/layout2paint/dataset/6800/JPEGImages-pre_new_txt"
+  max_layout_length: 30
+  max_text_length: 64
+
+training:
+  # === Stage 1: Supervised Pre-training ===
+  batch_size: 128         
+  epochs: 100             
+  learning_rate: 0.0001
+  warmup_steps: 1000      
+  
+  # Logging & Saving
+  save_every: 50          
+  output_dir: "./outputs/layout_results" # [建议] 改个新名字，方便区分
+  log_steps: 10
+  visualize_every: 5      
+
+  # === Stage 2: RL Fine-tuning Configuration (V11.0 核心) ===
+  rl_epochs: 400          
+  
+  # [CRITICAL] 学习率必须调低！因为 V11 用了指数级激励，梯度很大。
+  rl_learning_rate: 2e-6  
+  
+# RL Rewards Weights (建议调整如下)
+  reward_weights:
+    iou: 2.0
+    relation: 4.0        # [微调] 加强空间关系约束
+    
+    physics: 6.0         # [加强] 强力压制“山”等意象的无限制生长
+    alignment: 4.0       # [调低] 配合向量化后的 pow(alignment, 2) 逻辑，防止强引力扎堆
+    heatmap_size: 2.5    # [加强] 强制要求框的大小必须匹配热力图感知大小
+    
+    dispersion: 6.0      # [加强] 强制意象散开，解决堆叠问题
+    overlap: -8.0        # [加强] 绝对禁止重叠，提高熔断门槛
+    boundary: -3.0       # [加强] 确保意象完全在画布内，有利于 Stage 2 的 Ink Mask 生成
+
+inference:
+  max_output_length: 30
