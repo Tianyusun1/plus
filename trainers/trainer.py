@@ -1,4 +1,4 @@
-# File: trainers/trainer.py (V9.0: Full Integration for Heatmap-Aware Training)
+# File: trainers/trainer.py (V10.0: Text-to-Gestalt Enhanced Training)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -31,8 +31,15 @@ from inference.greedy_decode import greedy_decode_poem_layout
 from data.visualize import draw_layout
 import matplotlib.pyplot as plt 
 
-# --- 导入损失计算函数 ---
-from trainers.loss import compute_kl_loss
+# =============================================================================
+# [V10.0] 导入新的损失计算函数
+# =============================================================================
+from trainers.loss import (
+    compute_kl_loss, 
+    compute_gestalt_loss,
+    get_gestalt_loss_weights,
+    analyze_semantic_prior_coverage
+)
 
 class LayoutTrainer:
     """负责训练循环、优化器管理、日志记录和模型保存。"""
@@ -51,6 +58,12 @@ class LayoutTrainer:
         self.tokenizer = tokenizer
         self.example_poem = example_poem
         
+        # ==========================================================================
+        # [V10.0] 获取Gestalt损失策略
+        # ==========================================================================
+        self.gestalt_strategy = config.get('gestalt_strategy', 'progressive')
+        print(f"Gestalt Loss Strategy: {self.gestalt_strategy}")
+        
         # 训练和保存频率设置
         self.lr = config['training']['learning_rate'] # Store base LR
         self.optimizer = optim.AdamW(
@@ -66,6 +79,7 @@ class LayoutTrainer:
         # 分离绘图路径
         self.plot_path_recons = os.path.join(self.output_dir, "recons_trajectory.png")
         self.plot_path_kl = os.path.join(self.output_dir, "kl_trajectory.png")
+        self.plot_path_gestalt = os.path.join(self.output_dir, "gestalt_trajectory.png")  # [NEW]
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 学习率调度器初始化
@@ -94,9 +108,16 @@ class LayoutTrainer:
         self.val_alignment_history = []
         self.val_balance_history = []
         self.val_clustering_history = []
+        self.val_consistency_history = []  # [NEW]
         
-        # [NEW V8.0] 视觉态势损失历史
-        self.val_gestalt_history = []
+        # ==========================================================================
+        # [NEW V10.0] 态势损失细分历史
+        # ==========================================================================
+        self.val_gestalt_total_history = []    # 总态势损失
+        self.val_gestalt_pixel_history = []    # 像素监督
+        self.val_gestalt_semantic_history = [] # 语义先验
+        self.val_gestalt_smooth_history = []   # 空间平滑
+        self.val_text_align_history = []       # 文本对齐
 
     def _get_lr_scheduler(self):
         """定义带线性 Warmup、5 Epoch Hold 和后续衰减的学习率调度器。"""
@@ -147,21 +168,33 @@ class LayoutTrainer:
         else:
             kl_progress = min(1.0, (epoch - kl_transition_start) / kl_transition_duration)
             kl_weight = target_kl * kl_progress
+        
+        # ==========================================================================
+        # [NEW V10.0] 策略 C: 动态Gestalt权重
+        # ==========================================================================
+        gestalt_weights = get_gestalt_loss_weights(epoch, strategy=self.gestalt_strategy)
             
-        return new_rel_weight, new_reg_weight, kl_weight
+        return new_rel_weight, new_reg_weight, kl_weight, gestalt_weights
 
     def _run_epoch(self, data_loader, is_training: bool, epoch: int = 0):
         self.model.train() if is_training else self.model.eval()
         
         if is_training:
-            cur_rel_w, cur_reg_w, cur_kl_w = self._update_curriculum(epoch)
+            cur_rel_w, cur_reg_w, cur_kl_w, gestalt_w = self._update_curriculum(epoch)
         else:
-            cur_rel_w = 5.0; cur_reg_w = 1.0; cur_kl_w = 0.01 
+            cur_rel_w = 5.0; cur_reg_w = 1.0; cur_kl_w = 0.01
+            gestalt_w = {'pixel': 1.0, 'semantic': 2.0, 'smooth': 0.3}
 
         total_loss_val = 0.0
         t_reg = t_iou = t_area = t_rel = t_over = t_size = 0.0
-        t_align = t_bal = t_clus = t_cons = t_gest = 0.0
+        t_align = t_bal = t_clus = t_cons = 0.0
         t_kl = 0.0
+        
+        # ==========================================================================
+        # [NEW V10.0] 态势损失细分累加器
+        # ==========================================================================
+        t_gest_total = t_gest_pixel = t_gest_semantic = t_gest_smooth = 0.0
+        t_text_align = 0.0
         
         context_manager = contextlib.nullcontext() if is_training else torch.no_grad()
         data_len = len(data_loader)
@@ -173,8 +206,10 @@ class LayoutTrainer:
                     if isinstance(batch[k], torch.Tensor):
                         batch[k] = batch[k].to(self.device)
                 
-                # 2. 前向传播 [V9.0 改动：接收 5 个返回值]
-                mu, logvar, pred_boxes, decoder_output, pred_heatmaps = self.model(
+                # =======================================================================
+                # 2. 前向传播 [V10.0 改动：接收 6 个返回值，包含 aux_outputs]
+                # =======================================================================
+                mu, logvar, pred_boxes, decoder_output, pred_heatmaps, aux_outputs = self.model(
                     input_ids=batch['input_ids'], 
                     attention_mask=batch['attention_mask'], 
                     kg_class_ids=batch['kg_class_ids'], 
@@ -184,7 +219,9 @@ class LayoutTrainer:
                     target_boxes=batch['target_boxes']
                 )
                 
-                # 3. 计算损失
+                # =======================================================================
+                # 3. 计算基础布局损失 (从模型的get_loss)
+                # =======================================================================
                 loss_tuple = self.model.get_loss(
                     pred_cls=None, pred_bbox_ids=None, pred_boxes=pred_boxes, 
                     pred_count=None, layout_seq=None, layout_mask=batch['loss_mask'], 
@@ -193,14 +230,38 @@ class LayoutTrainer:
                     kg_class_weights=batch.get('kg_class_weights'),
                     kg_class_ids=batch['kg_class_ids'], 
                     decoder_output=decoder_output,
-                    gestalt_mask=batch.get('gestalt_mask')
+                    gestalt_mask=batch.get('gestalt_mask'),
+                    aux_outputs=aux_outputs  # [NEW V10.0]
                 )
                 
-                # [V9.0 同步解包 12 个损失项]
+                # [V10.0 解包 13 个损失项 (新增 loss_text_align)]
                 (loss_recons, l_rel, l_over, l_reg, l_iou, l_size, l_area, 
-                 l_align, l_bal, l_clus, l_cons, l_gestalt) = loss_tuple
+                 l_align, l_bal, l_clus, l_cons, l_gestalt_simple, l_text_align) = loss_tuple
                 
-                # 4. KL 散度
+                # =======================================================================
+                # [NEW V10.0] 4. 用新的compute_gestalt_loss替换简单态势损失
+                # =======================================================================
+                pred_gestalt = pred_boxes[..., 4:]  # [B, N, 4]
+                target_gestalt = batch['target_boxes'][..., 4:]  # [B, N, 4]
+                pred_coords = pred_boxes[..., :4]  # [B, N, 4]
+                
+                loss_gest_total, loss_gest_pixel, loss_gest_semantic, loss_gest_smooth = compute_gestalt_loss(
+                    pred_gestalt=pred_gestalt,
+                    target_gestalt=target_gestalt,
+                    loss_mask=batch['loss_mask'],
+                    gestalt_mask=batch.get('gestalt_mask'),
+                    kg_class_ids=batch['kg_class_ids'],
+                    pred_coords=pred_coords
+                )
+                
+                # 用新的细粒度态势损失替换原来的简单损失
+                # 注意：这里要减去model.get_loss中已经计算的l_gestalt_simple，避免重复计算
+                loss_recons = loss_recons - self.model.gestalt_loss_weight * l_gestalt_simple + \
+                              self.model.gestalt_loss_weight * loss_gest_total
+                
+                # =======================================================================
+                # 5. KL 散度
+                # =======================================================================
                 if mu is not None and logvar is not None:
                     kl_val = compute_kl_loss(mu, logvar, free_bits=1.0)
                 else:
@@ -208,6 +269,9 @@ class LayoutTrainer:
                 
                 final_loss = loss_recons + cur_kl_w * kl_val
                 
+                # =======================================================================
+                # 6. 反向传播
+                # =======================================================================
                 if is_training:
                     self.optimizer.zero_grad()
                     final_loss.backward()
@@ -216,22 +280,49 @@ class LayoutTrainer:
                     self.scheduler.step()
                     self.global_step += 1
                 
-                # 累加
+                # =======================================================================
+                # 7. 累加损失
+                # =======================================================================
                 total_loss_val += final_loss.item()
                 t_reg += l_reg.item(); t_iou += l_iou.item(); t_area += l_area.item()
                 t_rel += l_rel.item(); t_over += l_over.item(); t_size += l_size.item()
                 t_align += l_align.item(); t_bal += l_bal.item(); t_clus += l_clus.item()
-                t_cons += l_cons.item(); t_gest += l_gestalt.item()
+                t_cons += l_cons.item()
                 t_kl += kl_val.item()
                 
+                # [NEW V10.0] 态势损失细分
+                t_gest_total += loss_gest_total.item()
+                t_gest_pixel += loss_gest_pixel.item()
+                t_gest_semantic += loss_gest_semantic.item()
+                t_gest_smooth += loss_gest_smooth.item()
+                t_text_align += l_text_align.item()
+                
+                # =======================================================================
+                # 8. 日志输出
+                # =======================================================================
                 if is_training and (step + 1) % self.log_steps == 0:
                     print(f"Epoch [{epoch+1}][TRAIN] {step+1}/{data_len} | "
                           f"Tot:{final_loss.item():.3f} | Rel:{l_rel.item():.3f} | "
-                          f"Reg:{l_reg.item():.3f} | Gest:{l_gestalt.item():.3f} | KL:{kl_val.item():.3f}")
+                          f"Reg:{l_reg.item():.3f} | KL:{kl_val.item():.3f}")
+                    print(f"  Gestalt Breakdown: Pixel={loss_gest_pixel.item():.4f}, "
+                          f"Semantic={loss_gest_semantic.item():.4f}, "
+                          f"Smooth={loss_gest_smooth.item():.4f}, "
+                          f"TextAlign={l_text_align.item():.4f}")
+                    
+                    # [NEW V10.0] 语义先验覆盖率分析 (每100步)
+                    if (step + 1) % 100 == 0:
+                        coverage_stats = analyze_semantic_prior_coverage(
+                            batch['kg_class_ids'], 
+                            batch['loss_mask']
+                        )
+                        print(f"  Semantic Coverage: {coverage_stats['covered_objects']}/{coverage_stats['total_objects']} "
+                              f"({100*coverage_stats['coverage_rate']:.1f}%)")
         
         n = len(data_loader) if len(data_loader) > 0 else 1
         return (total_loss_val/n, t_rel/n, t_over/n, t_reg/n, t_iou/n, t_size/n, t_area/n, 
-                t_align/n, t_bal/n, t_clus/n, t_cons/n, t_gest/n, t_kl/n)
+                t_align/n, t_bal/n, t_clus/n, t_cons/n, 
+                t_gest_total/n, t_gest_pixel/n, t_gest_semantic/n, t_gest_smooth/n,
+                t_text_align/n, t_kl/n)
 
     def validate(self, epoch=0):
         start_time = time.time()
@@ -239,12 +330,16 @@ class LayoutTrainer:
         
         avg_vals = self._run_epoch(self.val_loader, is_training=False, epoch=epoch)
         (avg_loss, avg_rel, avg_over, avg_reg, avg_iou, avg_size, avg_area, 
-         avg_align, avg_bal, avg_clus, avg_cons, avg_gest, avg_kl) = avg_vals
+         avg_align, avg_bal, avg_clus, avg_cons, 
+         avg_gest_total, avg_gest_pixel, avg_gest_semantic, avg_gest_smooth,
+         avg_text_align, avg_kl) = avg_vals
         
         end_time = time.time()
         print(f"--- Validation Finished in {end_time - start_time:.2f}s ---")
         
+        # ==========================================================================
         # 记录历史
+        # ==========================================================================
         self.val_loss_history.append(avg_loss)
         self.val_reg_history.append(avg_reg) 
         self.val_iou_history.append(avg_iou)
@@ -255,11 +350,24 @@ class LayoutTrainer:
         self.val_alignment_history.append(avg_align) 
         self.val_balance_history.append(avg_bal)
         self.val_clustering_history.append(avg_clus)
-        self.val_gestalt_history.append(avg_gest)
+        self.val_consistency_history.append(avg_cons)
         self.val_kl_history.append(avg_kl)
         
-        print(f"Val Avg: Total:{avg_loss:.4f} | Rel:{avg_rel:.3f} | Over:{avg_over:.3f} | "
-              f"Reg:{avg_reg:.3f} | Cons:{avg_cons:.3f} | Gest:{avg_gest:.3f} | KL:{avg_kl:.3f}") 
+        # [NEW V10.0] 态势损失细分
+        self.val_gestalt_total_history.append(avg_gest_total)
+        self.val_gestalt_pixel_history.append(avg_gest_pixel)
+        self.val_gestalt_semantic_history.append(avg_gest_semantic)
+        self.val_gestalt_smooth_history.append(avg_gest_smooth)
+        self.val_text_align_history.append(avg_text_align)
+        
+        # ==========================================================================
+        # 打印汇总
+        # ==========================================================================
+        print(f"Val Avg: Total={avg_loss:.4f} | Rel={avg_rel:.3f} | Over={avg_over:.3f} | "
+              f"Reg={avg_reg:.3f} | Cons={avg_cons:.3f} | KL={avg_kl:.3f}")
+        print(f"  Gestalt Total={avg_gest_total:.4f} | Pixel={avg_gest_pixel:.4f} | "
+              f"Semantic={avg_gest_semantic:.4f} | Smooth={avg_gest_smooth:.4f}")
+        print(f"  Text-Gestalt Align={avg_text_align:.4f}")
               
         return avg_loss
 
@@ -319,6 +427,9 @@ class LayoutTrainer:
         if not self.train_loss_history: return
         epochs = range(1, len(self.train_loss_history) + 1)
         
+        # ==========================================================================
+        # 图1: 总体重建损失
+        # ==========================================================================
         plt.figure(figsize=(12, 8))
         plt.plot(epochs, self.train_loss_history, label='Train Total', color='blue', marker='o', alpha=0.6)
         plt.plot(epochs, self.val_loss_history, label='Val Total', color='red', marker='s', alpha=0.8)
@@ -327,9 +438,10 @@ class LayoutTrainer:
             plt.plot(epochs, self.val_relation_history, label='Val Rel', linestyle=':', alpha=0.7)
             plt.plot(epochs, self.val_overlap_history, label='Val Over', linestyle=':', alpha=0.7)
             plt.plot(epochs, self.val_reg_history, label='Val Reg', linestyle='--', alpha=0.5) 
-            plt.plot(epochs, self.val_gestalt_history, label='Val Gestalt', color='black', linewidth=2, linestyle='-')
+            plt.plot(epochs, self.val_gestalt_total_history, label='Val Gestalt Total', 
+                    color='purple', linewidth=2, linestyle='-')
 
-        plt.title('Loss Trajectory (V9.0: Heatmap & Visual Gestalt)', fontsize=14)
+        plt.title('Loss Trajectory (V10.0: Text-to-Gestalt Enhanced)', fontsize=14)
         plt.xlabel('Epoch', fontsize=12)
         plt.ylabel('Loss Value', fontsize=12)
         plt.legend(loc='upper right', fontsize=10)
@@ -341,37 +453,91 @@ class LayoutTrainer:
         except Exception as e:
             print(f"[Warning] Could not save Reconstruction loss plot: {e}")
 
+        # ==========================================================================
+        # 图2: KL散度轨迹
+        # ==========================================================================
         if len(self.val_kl_history) > 1:
             plt.figure(figsize=(10, 6))
-            plt.plot(epochs, self.val_kl_history, label='Original KL Div', color='darkblue', marker='.', linestyle='-')
+            plt.plot(epochs, self.val_kl_history, label='Val KL Div', color='darkblue', marker='.', linestyle='-')
             kl_weights = [self._update_curriculum(e - 1)[2] for e in epochs]
             ax2 = plt.gca().twinx()
             ax2.plot(epochs, kl_weights, label='KL Weight', color='red', linestyle='--', alpha=0.5)
             ax2.set_ylabel('KL Weight', color='red')
             plt.title('KL Divergence Trajectory', fontsize=14)
-            plt.legend(loc='upper right')
+            plt.xlabel('Epoch')
+            plt.gca().set_ylabel('KL Divergence')
+            plt.legend(loc='upper left')
+            ax2.legend(loc='upper right')
             plt.grid(True, linestyle='--')
             try:
                 plt.savefig(self.plot_path_kl)
                 plt.close()
             except Exception: pass
+        
+        # ==========================================================================
+        # [NEW V10.0] 图3: 态势损失细分轨迹
+        # ==========================================================================
+        if len(self.val_gestalt_pixel_history) > 1:
+            plt.figure(figsize=(12, 7))
+            
+            plt.plot(epochs, self.val_gestalt_total_history, 
+                    label='Total Gestalt', color='black', linewidth=2.5, marker='o')
+            plt.plot(epochs, self.val_gestalt_pixel_history, 
+                    label='Pixel Supervision', color='blue', linestyle='--', marker='s', alpha=0.7)
+            plt.plot(epochs, self.val_gestalt_semantic_history, 
+                    label='Semantic Prior', color='green', linestyle='--', marker='^', alpha=0.7)
+            plt.plot(epochs, self.val_gestalt_smooth_history, 
+                    label='Spatial Smoothness', color='orange', linestyle=':', marker='d', alpha=0.6)
+            plt.plot(epochs, self.val_text_align_history, 
+                    label='Text-Gestalt Alignment', color='red', linestyle='-.', marker='*', 
+                    linewidth=2, alpha=0.8)
+            
+            plt.title('Gestalt Loss Breakdown (V10.0)', fontsize=14)
+            plt.xlabel('Epoch', fontsize=12)
+            plt.ylabel('Loss Value', fontsize=12)
+            plt.legend(loc='upper right', fontsize=10)
+            plt.grid(True, linestyle='--', alpha=0.5)
+            
+            try:
+                plt.savefig(self.plot_path_gestalt)
+                plt.close()
+                print(f"✓ Gestalt breakdown plot saved to {self.plot_path_gestalt}")
+            except Exception as e:
+                print(f"[Warning] Could not save Gestalt breakdown plot: {e}")
 
     def train(self):
         """主训练循环"""
-        print("--- Starting Full Training ---")
+        print("\n" + "="*80)
+        print(">>> STARTING FULL TRAINING (V10.0: Text-to-Gestalt Enhanced) <<<")
+        print("="*80)
         best_val_loss = float('inf')
         
         print(f"Total training steps: {self.total_steps}, Warmup steps: {self.warmup_steps}, Base LR: {self.lr:.6e}")
+        print(f"Gestalt Strategy: {self.gestalt_strategy}")
+        print("="*80 + "\n")
         
         for epoch in range(self.epochs):
             epoch_start_time = time.time()
-            print(f"\n==================== Epoch {epoch+1}/{self.epochs} | Training ====================")
+            print(f"\n{'='*80}")
+            print(f"Epoch {epoch+1}/{self.epochs} | Training")
+            print(f"{'='*80}")
+            
+            # ==========================================================================
+            # [NEW V10.0] 打印当前epoch的课程学习配置
+            # ==========================================================================
+            cur_rel_w, cur_reg_w, cur_kl_w, gestalt_w = self._update_curriculum(epoch)
+            print(f"Curriculum Config:")
+            print(f"  Relation Weight: {cur_rel_w:.2f} | Reg Weight: {cur_reg_w:.2f} | KL Weight: {cur_kl_w:.4f}")
+            print(f"  Gestalt Weights: Pixel={gestalt_w['pixel']:.2f}, "
+                  f"Semantic={gestalt_w['semantic']:.2f}, Smooth={gestalt_w['smooth']:.2f}")
+            print("-"*80)
             
             avg_train_loss = self._run_epoch(self.train_loader, is_training=True, epoch=epoch)[0]
             self.train_loss_history.append(avg_train_loss)
             
             epoch_end_time = time.time()
-            print(f"\nEpoch {epoch+1} finished. Avg Training Loss: {avg_train_loss:.4f} ({epoch_end_time - epoch_start_time:.2f}s)")
+            print(f"\nEpoch {epoch+1} Training Complete. Avg Loss: {avg_train_loss:.4f} "
+                  f"({epoch_end_time - epoch_start_time:.2f}s)")
             
             avg_val_loss = self.validate(epoch=epoch) 
 
@@ -390,10 +556,10 @@ class LayoutTrainer:
                      'optimizer_state_dict': self.optimizer.state_dict()}, 
                     checkpoint_path
                 )
-                print(f"-> Checkpoint saved to {checkpoint_path}")
+                print(f"💾 Checkpoint saved to {checkpoint_path}")
 
             if avg_val_loss < best_val_loss:
-                print("-> New best validation loss achieved. Replacing previous best model.")
+                print("🌟 New best validation loss achieved! Replacing previous best model.")
                 if self.current_best_model_path and os.path.exists(self.current_best_model_path):
                     try: os.remove(self.current_best_model_path)
                     except: pass
@@ -409,7 +575,9 @@ class LayoutTrainer:
                      'optimizer_state_dict': self.optimizer.state_dict()}, 
                     new_best_path
                 )
-                print(f"-> New best model saved to {new_best_path}")
+                print(f"💾 New best model saved to {new_best_path}")
                 self.current_best_model_path = new_best_path
                     
-        print("\n--- Training Completed ---")
+        print("\n" + "="*80)
+        print(">>> TRAINING COMPLETED <<<")
+        print("="*80)

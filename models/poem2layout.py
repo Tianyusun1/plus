@@ -1,4 +1,4 @@
-# models/poem2layout.py (V9.0: Heatmap Projection & Generation - Full Version)
+# models/poem2layout.py (V10.0: Text-to-Gestalt Alignment Enhanced)
 
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ except ImportError:
 from .decoder import LayoutDecoder
 
 # ==========================================
-# [V8.2] 定义类别“基准”面积先验 (Base Area Ratio)
+# [V8.2] 定义类别"基准"面积先验 (Base Area Ratio)
 # ==========================================
 CLASS_AREA_PRIORS = {
     2: 0.30,   # Mountain (山)
@@ -220,7 +220,7 @@ class Poem2LayoutGenerator(nn.Module):
             nn.Linear(hidden_size, 4)
         )
 
-        # B. 形态态势头
+        # B. 形态态势头 (Decoder预测路径)
         self.gestalt_dir_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size // 2),
             nn.ReLU(),
@@ -234,6 +234,27 @@ class Poem2LayoutGenerator(nn.Module):
             nn.Linear(hidden_size // 2, 1),
             nn.Tanh()
         )
+        
+        # ==========================================================================
+        # [NEW V10.0] 文本-态势对齐模块 (Text-to-Gestalt Alignment)
+        # ==========================================================================
+        # C. 文本直接推理态势路径
+        self.text_to_gestalt = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, 4),  # 直接预测4维态势
+            nn.Tanh()  # 归一化到 [-1, 1]
+        )
+
+        # D. 态势融合门控 (决定用文本推理的还是Decoder预测的)
+        self.gestalt_gate = nn.Sequential(
+            nn.Linear(hidden_size + 4, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+            nn.Sigmoid()  # [0, 1]: 0=完全用文本, 1=完全用Decoder
+        )
+        # ==========================================================================
         
         # 10. Consistency Projection
         self.consistency_proj = nn.Linear(bb_size, hidden_size)
@@ -349,25 +370,51 @@ class Poem2LayoutGenerator(nn.Module):
             src_mask, trg_mask, spatial_bias=spatial_bias
         ) 
 
+        # ==========================================================================
+        # [V10.0] 双路态势预测 + 自适应融合
+        # ==========================================================================
         # === Outputs ===
         pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
-        pred_dir = self.gestalt_dir_head(decoder_output)   
-        pred_flow = self.gestalt_flow_head(decoder_output) 
-        pred_gestalt = torch.cat([pred_dir, pred_flow], dim=-1)
+        
+        # 路径1: Decoder预测 (依赖全局上下文)
+        pred_dir_decoder = self.gestalt_dir_head(decoder_output)   
+        pred_flow_decoder = self.gestalt_flow_head(decoder_output) 
+        gestalt_decoder = torch.cat([pred_dir_decoder, pred_flow_decoder], dim=-1)  # [B, T, 4]
+
+        # 路径2: 文本直接推理 (依赖类别语义)
+        text_stream = decoder_output[..., :self.hidden_size]  # [B, T, 768]
+        gestalt_text = self.text_to_gestalt(text_stream)  # [B, T, 4]
+
+        # 自适应融合
+        gate_input = torch.cat([text_stream, gestalt_decoder], dim=-1)  # [B, T, 768+4]
+        alpha = self.gestalt_gate(gate_input)  # [B, T, 1]
+
+        # 最终态势: alpha * decoder + (1-alpha) * text
+        pred_gestalt = alpha * gestalt_decoder + (1 - alpha) * gestalt_text
         
         dynamic_layout = torch.cat([pred_boxes, pred_gestalt], dim=-1)
         
         # [NEW V9.0] 在 forward 中计算热力图并返回 (第5个参数)
         pred_heatmaps = self.generate_heatmaps(decoder_output) # [B, T, 64, 64]
         
-        return mu, logvar, dynamic_layout, decoder_output, pred_heatmaps
+        # ==========================================================================
+        # [NEW V10.0] 返回辅助信息用于分析和Loss计算
+        # ==========================================================================
+        aux_outputs = {
+            'gestalt_decoder': gestalt_decoder,  # Decoder预测的态势
+            'gestalt_text': gestalt_text,        # 文本推理的态势
+            'gestalt_gate': alpha,               # 融合权重
+            'text_stream': text_stream           # 文本特征流
+        }
+        
+        return mu, logvar, dynamic_layout, decoder_output, pred_heatmaps, aux_outputs
 
     # [NEW V9.0] 适配 RL 训练，返回三元组
     def forward_rl(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
                    kg_spatial_matrix=None, location_grids=None, target_boxes=None, 
                    sample=True):
-        # 接收 5 个返回值
-        _, _, dynamic_layout_mu, decoder_output, pred_heatmaps = self.forward(
+        # 接收 6 个返回�� (新增 aux_outputs)
+        _, _, dynamic_layout_mu, decoder_output, pred_heatmaps, aux_outputs = self.forward(
             input_ids, attention_mask, kg_class_ids, padding_mask, 
             kg_spatial_matrix, location_grids, target_boxes=None
         )
@@ -401,7 +448,8 @@ class Poem2LayoutGenerator(nn.Module):
         device = boxes.device
         y_grid, x_grid = torch.meshgrid(
             torch.linspace(0, 1, grid_size, device=device), 
-            torch.linspace(0, 1, grid_size, device=device)
+            torch.linspace(0, 1, grid_size, device=device),
+            indexing='ij'  # 明确指定索引方式，避免警告
         )
         grid = torch.stack([x_grid, y_grid], dim=-1).view(1, 1, grid_size, grid_size, 2)
         cx = boxes[..., 0].view(B, T, 1, 1)
@@ -416,7 +464,10 @@ class Poem2LayoutGenerator(nn.Module):
 
     def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, 
                  target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None, 
-                 decoder_output=None, gestalt_mask=None): 
+                 decoder_output=None, gestalt_mask=None, aux_outputs=None):  # [NEW V10.0] 新增参数
+        """
+        [V10.0 升级] 集成文本-态势对齐损失
+        """
         loss_mask = layout_mask 
         pred_coords = pred_boxes[..., :4]
         pred_gestalt = pred_boxes[..., 4:]
@@ -435,7 +486,9 @@ class Poem2LayoutGenerator(nn.Module):
         
         num_valid = loss_mask.sum().clamp(min=1)
 
+        # ==========================================================================
         # 1. 基础几何损失
+        # ==========================================================================
         loss_reg = F.smooth_l1_loss(pred_coords, target_boxes, reduction='none') 
         loss_reg = (loss_reg.mean(dim=-1) * loss_mask).sum() / num_valid
         
@@ -448,7 +501,9 @@ class Poem2LayoutGenerator(nn.Module):
         loss_area = F.smooth_l1_loss(pred_area, tgt_area, reduction='none')
         loss_area = (loss_area * loss_mask).sum() / num_valid
         
+        # ==========================================================================
         # 2. 高级布局损失
+        # ==========================================================================
         loss_relation = self._compute_relation_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
         loss_overlap = self._compute_overlap_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
         loss_size_prior = self._compute_size_loss(pred_coords, loss_mask, num_boxes, kg_class_ids=kg_class_ids)
@@ -457,7 +512,11 @@ class Poem2LayoutGenerator(nn.Module):
         loss_clustering = self._compute_clustering_loss(pred_coords, loss_mask, kg_class_ids)
         loss_consistency = self._compute_consistency_loss(decoder_output, loss_mask)
 
-        # 3. 像素级弱监督态势损失
+        # ==========================================================================
+        # 3. 态势损失 (从trainers/loss.py调用，这里只保留简化版用于兼容)
+        # ==========================================================================
+        # 注意：详细的态势损失(像素+语义+平滑)应该在trainer中调用compute_gestalt_loss
+        # 这里只保留基础像素监督作为后备
         loss_gestalt = torch.tensor(0.0, device=pred_boxes.device)
         if has_gestalt_gt:
             loss_g_vec = F.smooth_l1_loss(pred_gestalt, target_gestalt, reduction='none')
@@ -469,7 +528,33 @@ class Poem2LayoutGenerator(nn.Module):
             num_gestalt_valid = combined_mask.sum().clamp(min=1)
             loss_gestalt = (loss_g_val * combined_mask).sum() / num_gestalt_valid
 
-        # 4. [NEW V9.0] 热力图监督损失
+        # ==========================================================================
+        # [NEW V10.0] 4. 文本-态势对齐损失 (Text-to-Gestalt Alignment Loss)
+        # ==========================================================================
+        loss_text_align = torch.tensor(0.0, device=pred_boxes.device)
+        if aux_outputs is not None and 'gestalt_text' in aux_outputs:
+            from trainers.loss import compute_text_gestalt_alignment_loss
+            
+            # 检查函数是否存在，如果不存在则跳过（向后兼容）
+            try:
+                loss_text_align = compute_text_gestalt_alignment_loss(
+                    aux_outputs['gestalt_text'],      # 文本推理的态势
+                    aux_outputs['gestalt_decoder'],   # Decoder预测的态势
+                    kg_class_ids,
+                    loss_mask
+                )
+            except (ImportError, NameError):
+                # 如果loss.py还没更新compute_text_gestalt_alignment_loss，使用简化版
+                gestalt_text = aux_outputs['gestalt_text']
+                gestalt_decoder = aux_outputs['gestalt_decoder']
+                
+                # 简单的一致性损失：鼓励两条路径的预测接近
+                text_decoder_diff = F.mse_loss(gestalt_text, gestalt_decoder, reduction='none').mean(dim=-1)
+                loss_text_align = (text_decoder_diff * loss_mask).sum() / num_valid
+
+        # ==========================================================================
+        # 5. [NEW V9.0] 热力图监督损失
+        # ==========================================================================
         loss_heatmap = torch.tensor(0.0, device=pred_boxes.device)
         if decoder_output is not None:
             # 重新生成 Heatmap 用于计算 Loss
@@ -480,22 +565,29 @@ class Poem2LayoutGenerator(nn.Module):
             hm_loss_map = F.mse_loss(pred_heatmaps, gt_heatmaps, reduction='none').mean(dim=[2, 3])
             loss_heatmap = (hm_loss_map * loss_mask).sum() / num_valid
 
-        total_loss = self.reg_loss_weight * loss_reg + \
-                      self.iou_loss_weight * loss_iou + \
-                      self.area_loss_weight * loss_area + \
-                      self.relation_loss_weight * loss_relation + \
-                      self.overlap_loss_weight * loss_overlap + \
-                      self.size_loss_weight * loss_size_prior + \
-                      self.alignment_loss_weight * loss_alignment + \
-                      self.balance_loss_weight * loss_balance + \
-                      self.clustering_loss_weight * loss_clustering + \
-                      self.consistency_loss_weight * loss_consistency + \
-                      self.gestalt_loss_weight * loss_gestalt + \
-                      5.0 * loss_heatmap # 强监督热力图
+        # ==========================================================================
+        # 6. 总损失汇总
+        # ==========================================================================
+        total_loss = (
+            self.reg_loss_weight * loss_reg +
+            self.iou_loss_weight * loss_iou +
+            self.area_loss_weight * loss_area +
+            self.relation_loss_weight * loss_relation +
+            self.overlap_loss_weight * loss_overlap +
+            self.size_loss_weight * loss_size_prior +
+            self.alignment_loss_weight * loss_alignment +
+            self.balance_loss_weight * loss_balance +
+            self.clustering_loss_weight * loss_clustering +
+            self.consistency_loss_weight * loss_consistency +
+            self.gestalt_loss_weight * loss_gestalt +
+            1.0 * loss_text_align +  # [NEW V10.0] 文本对齐损失权重
+            5.0 * loss_heatmap       # 强监督热力图
+        )
                       
         return total_loss, loss_relation, loss_overlap, \
                loss_reg, loss_iou, loss_size_prior, loss_area, \
-               loss_alignment, loss_balance, loss_clustering, loss_consistency, loss_gestalt
+               loss_alignment, loss_balance, loss_clustering, \
+               loss_consistency, loss_gestalt, loss_text_align  # [NEW] 返回新损失
 
     def _compute_consistency_loss(self, decoder_output, mask):
         if decoder_output is None:

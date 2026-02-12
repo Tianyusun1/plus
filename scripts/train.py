@@ -1,4 +1,4 @@
-# scripts/train.py (V8.0: Adapted for Visual Gestalt Supervision)
+# scripts/train.py (V10.0: Enhanced Text-to-Gestalt Learning)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -21,6 +21,7 @@ from data.dataset import PoegraphLayoutDataset, layout_collate_fn
 from models.poem2layout import Poem2LayoutGenerator
 import trainers 
 from trainers.rl_trainer import RLTrainer 
+from trainers.loss import analyze_semantic_prior_coverage, get_gestalt_loss_weights  # [NEW V10.0]
 from collections import Counter
 import numpy as np 
 
@@ -84,12 +85,108 @@ def compute_class_weights(dataset, num_classes: int, max_weight_ratio: float = 3
     return weights.float()
 # ------------------------------------------
 
+# =============================================================================
+# [NEW V10.0] 数据集统计分析函数
+# =============================================================================
+def analyze_dataset_statistics(dataset):
+    """
+    分析数据集的态势提取质量和语义先验覆盖率
+    """
+    print("\n" + "="*70)
+    print(">>> DATASET STATISTICS ANALYSIS <<<")
+    print("="*70)
+    
+    # 1. 态势提取有效率统计
+    valid_gestalt_count = 0
+    total_object_count = 0
+    class_gestalt_stats = {cid: {'valid': 0, 'total': 0} for cid in range(2, 11)}
+    
+    print("\n[1/3] Analyzing Gestalt Extraction Coverage...")
+    for i in range(min(len(dataset), 1000)):  # 采样前1000个样本
+        sample = dataset[i]
+        loss_mask = sample['loss_mask']
+        gestalt_mask = sample['gestalt_mask']
+        kg_class_ids = sample['kg_class_ids']
+        
+        for j in range(len(kg_class_ids)):
+            if loss_mask[j] > 0:
+                cid = kg_class_ids[j].item()
+                if cid in class_gestalt_stats:
+                    class_gestalt_stats[cid]['total'] += 1
+                    if gestalt_mask[j] > 0:
+                        class_gestalt_stats[cid]['valid'] += 1
+                
+                total_object_count += 1
+                if gestalt_mask[j] > 0:
+                    valid_gestalt_count += 1
+    
+    overall_coverage = 100 * valid_gestalt_count / max(total_object_count, 1)
+    print(f"  Overall Gestalt Coverage: {valid_gestalt_count}/{total_object_count} ({overall_coverage:.1f}%)")
+    
+    print("\n  Per-Class Gestalt Coverage:")
+    class_names = {2: "mountain", 3: "water", 4: "people", 5: "tree", 
+                   6: "building", 7: "bridge", 8: "flower", 9: "bird", 10: "animal"}
+    for cid in sorted(class_gestalt_stats.keys()):
+        stats = class_gestalt_stats[cid]
+        if stats['total'] > 0:
+            ratio = 100 * stats['valid'] / stats['total']
+            name = class_names.get(cid, f"cls_{cid}")
+            print(f"    {name:12s} (ID {cid}): {stats['valid']:4d}/{stats['total']:4d} ({ratio:5.1f}%)")
+    
+    # 2. 语义先验覆盖率
+    print("\n[2/3] Analyzing Semantic Prior Coverage...")
+    batch = dataset[0]
+    coverage_stats = analyze_semantic_prior_coverage(
+        batch['kg_class_ids'].unsqueeze(0), 
+        batch['loss_mask'].unsqueeze(0)
+    )
+    print(f"  Semantic Prior Coverage: {coverage_stats['covered_objects']}/{coverage_stats['total_objects']} "
+          f"({100*coverage_stats['coverage_rate']:.1f}%)")
+    
+    # 3. 态势数值分布统计
+    print("\n[3/3] Analyzing Gestalt Value Distributions...")
+    gestalt_values = {'bias_x': [], 'bias_y': [], 'rotation': [], 'flow': []}
+    
+    for i in range(min(len(dataset), 500)):
+        sample = dataset[i]
+        target_boxes = sample['target_boxes']  # [N, 8]
+        loss_mask = sample['loss_mask']        # [N]
+        gestalt_mask = sample['gestalt_mask']  # [N]
+        
+        valid_mask = (loss_mask > 0) & (gestalt_mask > 0)
+        if valid_mask.sum() > 0:
+            valid_gestalt = target_boxes[valid_mask, 4:]  # [K, 4]
+            gestalt_values['bias_x'].extend(valid_gestalt[:, 0].tolist())
+            gestalt_values['bias_y'].extend(valid_gestalt[:, 1].tolist())
+            gestalt_values['rotation'].extend(valid_gestalt[:, 2].tolist())
+            gestalt_values['flow'].extend(valid_gestalt[:, 3].tolist())
+    
+    for key, values in gestalt_values.items():
+        if len(values) > 0:
+            mean_val = np.mean(values)
+            std_val = np.std(values)
+            min_val = np.min(values)
+            max_val = np.max(values)
+            print(f"  {key:12s}: mean={mean_val:6.3f}, std={std_val:6.3f}, range=[{min_val:6.3f}, {max_val:6.3f}]")
+    
+    print("="*70 + "\n")
+    
+    return {
+        'gestalt_coverage': overall_coverage,
+        'semantic_coverage': coverage_stats['coverage_rate'],
+        'class_stats': class_gestalt_stats
+    }
+
 
 def main():
     # [NEW] 添加命令行参数解析
     parser = argparse.ArgumentParser(description="Train or RL-Finetune Poem2Layout")
     parser.add_argument('--rl_tuning', action='store_true', help="Enable Reinforcement Learning fine-tuning mode")
     parser.add_argument('--checkpoint', type=str, default=None, help="Path to pretrained model checkpoint (required for RL tuning)")
+    parser.add_argument('--skip_analysis', action='store_true', help="Skip dataset statistics analysis")  # [NEW V10.0]
+    parser.add_argument('--gestalt_strategy', type=str, default='progressive', 
+                       choices=['fixed', 'progressive'], 
+                       help="Gestalt loss weighting strategy")  # [NEW V10.0]
     args = parser.parse_args()
 
     # 1. Load config
@@ -110,6 +207,22 @@ def main():
         max_text_length=model_config['max_text_length']
     )
     
+    # ==========================================================================
+    # [NEW V10.0] 数据集质量分析
+    # ==========================================================================
+    if not args.skip_analysis:
+        dataset_stats = analyze_dataset_statistics(dataset)
+        
+        # 根据统计结果给出建议
+        if dataset_stats['gestalt_coverage'] < 50.0:
+            print("⚠️  [WARNING] Gestalt extraction coverage is low (<50%)!")
+            print("    → Consider adjusting thresholds in VisualGestaltExtractor")
+            print("    → Or increase semantic prior weight to compensate\n")
+        
+        if dataset_stats['semantic_coverage'] < 80.0:
+            print("⚠️  [WARNING] Many objects are not covered by semantic priors!")
+            print("    → Consider adding more class IDs to SEMANTIC_GESTALT_PRIORS\n")
+    
     # --- 计算类别权重 ---
     num_element_classes = model_config['num_classes'] # 9
     class_weights_tensor = compute_class_weights(dataset, num_element_classes)
@@ -118,7 +231,7 @@ def main():
     # ---------------------------
 
     # 3. Init model (传入所有损失权重，包括新增的 Gestalt Loss Weight)
-    print(f"Initializing model with latent_dim={model_config.get('latent_dim', 32)}...")
+    print(f"\nInitializing model with latent_dim={model_config.get('latent_dim', 32)}...")
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
         num_classes=num_element_classes, # 实际元素类别数 (9)
@@ -158,13 +271,19 @@ def main():
         # [NEW V6.0] 一致性损失权重
         consistency_loss_weight=model_config.get('consistency_loss_weight', 1.0),
         
-        # [NEW V8.0] 视觉态势损失权重 (Visual Gestalt Supervision)
-        # 默认 2.0, 确保模型重视从原图提取出的物理规律
+        # [NEW V10.0] 视觉态势损失权重 (Visual Gestalt Supervision)
+        # 从配置文件读取，默认 2.0
         gestalt_loss_weight=model_config.get('gestalt_loss_weight', 2.0),
         
         class_weights=class_weights_tensor 
         # -----------------------------------------
     )
+    
+    # ==========================================================================
+    # [NEW V10.0] 将训练策略传递给config
+    # ==========================================================================
+    config['gestalt_strategy'] = args.gestalt_strategy
+    print(f"Gestalt Loss Strategy: {args.gestalt_strategy}")
 
     # 4. Split dataset and init data loaders
     total_size = len(dataset)
@@ -176,7 +295,7 @@ def main():
     train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
         dataset, [train_size, val_size, test_size]
     )
-    print(f"Dataset split: Train={train_size}, Validation={val_size}, Test={test_size}")
+    print(f"\nDataset split: Train={train_size}, Validation={val_size}, Test={test_size}")
 
     # [NOTE] Batch Size 读取自配置文件
     batch_size = train_config['batch_size']
@@ -214,28 +333,31 @@ def main():
     example_poem = dataset.data[example_idx_in_full_dataset]
     
     # **打印固定推理样例的 KG 向量和空间矩阵**
-    print("\n---------------------------------------------------")
-    print(f"Inference Example Poem: '{example_poem['poem']}'")
-    print(f"Inference Example GT Boxes: {example_poem['boxes']}")
-    print("-------------------- KG DEBUG ---------------------")
+    print("\n" + "="*60)
+    print(">>> INFERENCE EXAMPLE CONFIGURATION <<<")
+    print("="*60)
+    print(f"Poem: '{example_poem['poem']}'")
+    print(f"GT Boxes: {example_poem['boxes']}")
+    print("\n--- Knowledge Graph Debug ---")
     
     # 1. 视觉向量
     kg_vector_example = dataset.pkg.extract_visual_feature_vector(example_poem['poem'])
-    print(f"KG Vector (0:mountain(2), 1:water(3), ..., 8:animal(10)): {kg_vector_example.tolist()}")
+    print(f"KG Vector (0:mountain(2), 1:water(3), ..., 8:animal(10)):")
+    print(f"  {kg_vector_example.tolist()}")
     
     # 2. [NEW] 空间矩阵
     kg_spatial_matrix_example = dataset.pkg.extract_spatial_matrix(example_poem['poem'])
-    print("Spatial Matrix (9x9):")
+    print("\nSpatial Matrix (9x9):")
     print(kg_spatial_matrix_example)
-    print("---------------------------------------------------\n")
+    print("="*60 + "\n")
 
     # 5. Logic Branch: RL Tuning OR Supervised Training
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     if args.rl_tuning:
-        print("\n=======================================================")
+        print("\n" + "="*70)
         print(">>> ENTERING RL FINE-TUNING MODE (SCST) <<<")
-        print("=======================================================\n")
+        print("="*70 + "\n")
         
         # 1. 必须加载预训练模型
         if args.checkpoint is None:
@@ -267,7 +389,7 @@ def main():
             # [MODIFIED] 接收 train_rl_epoch 返回的 avg_reward
             avg_reward = trainer.train_rl_epoch(epoch)
             
-            # [NEW] 可视化：每轮 RL 结束生成一张样例图，直观看到模型变化
+            # [NEW] 可视化：每�� RL 结束生成一张样例图，直观看到模型变化
             trainer._run_inference_example(epoch)
             
             # === [NEW] 保存逻辑 A: 保存最棒的模型 (Best Reward) ===
@@ -298,8 +420,12 @@ def main():
                 
     else:
         # 原有的监督训练逻辑
-        print(">>> Starting Standard Supervised Training <<<")
+        print("\n" + "="*70)
+        print(">>> STARTING SUPERVISED TRAINING (Text-to-Gestalt Enhanced) <<<")
+        print("="*70)
         print(f"Total Epochs: {train_config['epochs']} | Batch Size: {batch_size}")
+        print(f"Gestalt Loss Strategy: {args.gestalt_strategy}")
+        print("="*70 + "\n")
         
         trainer = trainers.LayoutTrainer(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
         trainer.train()
