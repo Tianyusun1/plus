@@ -1,4 +1,4 @@
-# File: trainers/rl_trainer.py (V11.6: Fix Dimension Bug & Gravity)
+# File: trainers/rl_trainer.py (V12.0: Gestalt Physics Integration)
 
 import torch
 import torch.nn.functional as F
@@ -18,16 +18,61 @@ CLASS_SIZE_PRIORS = {
     7: 0.10, 4: 0.08, 10: 0.08, 8: 0.04, 9: 0.02
 }
 
+# === [V12.0 NEW] 势态物理先验 ===
+# 格式: class_id: {param_name: (target_value, tolerance)}
+GESTALT_PRIORS = {
+    2: {  # Mountain (山) - 静止、枯笔、水平
+        'flow': (-0.8, 0.2),      # 枯笔 [-1.0 to -0.6]
+        'rotation': (0.0, 0.3),   # 水平 [-0.3 to 0.3]
+    },
+    3: {  # Water (水) - 流动、湿笔、允许偏移
+        'flow': (0.6, 0.3),       # 湿笔 [0.3 to 0.9]
+        'bias_x': (0.0, 0.5),     # 流向偏移 [-0.5 to 0.5]
+    },
+    4: {  # People (人) - 中性笔触、站立感
+        'flow': (0.0, 0.4),       # 中性 [-0.4 to 0.4]
+        'bias_y': (-0.2, 0.3),    # 重心略上 [-0.5 to 0.1]
+    },
+    5: {  # Tree (树) - 略枯、倾斜、重心略上
+        'flow': (-0.3, 0.3),      # 略枯 [-0.6 to 0.0]
+        'rotation': (0.2, 0.4),   # 倾斜 [-0.2 to 0.6]
+        'bias_y': (-0.1, 0.3),    # 树冠 [-0.4 to 0.2]
+    },
+    6: {  # Building (建筑) - 静止、垂直
+        'flow': (-0.5, 0.3),      # 枯笔 [-0.8 to -0.2]
+        'rotation': (0.0, 0.2),   # 垂直 [-0.2 to 0.2]
+    },
+    7: {  # Bridge (桥) - 中性、水平跨度
+        'flow': (0.1, 0.4),       # 略湿 [-0.3 to 0.5]
+        'rotation': (0.0, 0.3),   # 水平 [-0.3 to 0.3]
+        'bias_x': (0.0, 0.6),     # 横跨
+    },
+    8: {  # Flower (花) - 湿润、细腻
+        'flow': (0.5, 0.3),       # 湿笔 [0.2 to 0.8]
+    },
+    9: {  # Bird (鸟) - 极湿、灵动、飞翔
+        'flow': (0.8, 0.2),       # 极湿 [0.6 to 1.0]
+        'bias_y': (-0.5, 0.3),    # 飞翔 [-0.8 to -0.2]
+    },
+    10: {  # Animal (动物) - 中性、重心低
+        'flow': (0.0, 0.4),       # 中性 [-0.4 to 0.4]
+        'bias_y': (0.2, 0.3),     # 重心低 [-0.1 to 0.5]
+    },
+}
+
 class RLTrainer(LayoutTrainer):
     """
-    [V11.6 Fixed] 修复 Tensor 维度崩溃 + 坚持 "顶部留白/物体沉底" 策略
+    [V12.0 Gestalt Enhanced] 完整集成势态物理约束
     
-    修正记录:
-    1. [CRITICAL FIX] 修复 train_rl_epoch 中的维度错误: [128, 7] * [128] -> 崩溃。
-       修正为先对 log_prob 求和得到 [128]，再与 Advantage 相乘。
-    2. [Deep Gravity] 既然你说 "留白应该在上边"，这意味着 "物体应该在下边"。
-       保持重心目标 Target Y = 0.75 (画布中下部)，权重 5.0，强力把物体往下拉。
-    3. [Relation Fix] 包含完整的 _calculate_relation_reward 函数。
+    新增功能:
+    1. [Gestalt Physics] 类别-势态匹配奖励 (water必须flow>0.5, mountain必须flow<-0.5)
+    2. [Gestalt Smoothness] 空间连续性奖励 (相邻物体态势平滑过渡)
+    3. [Gestalt Extreme] 极值惩罚 (防止参数爆炸到±1.0边界)
+    4. [Gestalt Supervision] 辅助监督损失 (防止RL破坏监督学习的势态知识)
+    
+    保留功能:
+    - [V11.6] Tensor维度修复 + 重力沉底策略
+    - [V10.0] 物理大小先验 + 空间关系约束
     """
     def __init__(self, model, train_loader, val_loader, config, tokenizer, example_poem, test_loader):
         super().__init__(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
@@ -37,43 +82,57 @@ class RLTrainer(LayoutTrainer):
         self.success_scale = 2.0
         self.failure_scale = 0.1
         
-        # --- 权重策略 ---
-        self.w_iou = 2.0    
-        self.w_rel = 4.0      
-        self.w_physics = 6.0    
-        self.w_align = 4.0      
-        self.w_hm_size = 2.5    
+        # --- 布局权重策略 ---
+        self.w_iou = config['training']['reward_weights'].get('iou', 2.0)
+        self.w_rel = config['training']['reward_weights'].get('relation', 4.0)
+        self.w_physics = config['training']['reward_weights'].get('physics', 6.0)
+        self.w_align = config['training']['reward_weights'].get('alignment', 4.0)
+        self.w_hm_size = config['training']['reward_weights'].get('heatmap_size', 2.5)
         
         # 斥力与惩罚
-        self.w_disp = 7.0      
-        self.w_overlap = -15.0 
-        self.w_bound = -3.0
+        self.w_disp = config['training']['reward_weights'].get('dispersion', 7.0)
+        self.w_overlap = config['training']['reward_weights'].get('overlap', -15.0)
+        self.w_bound = config['training']['reward_weights'].get('boundary', -3.0)
         
         # [关键策略] 重力沉底，留白在顶
-        self.w_balance = 5.0   # 强力拉拽物体向下 (Target Y=0.75)
-        self.w_center = 1.5    # 保持水平居中倾向
+        self.w_balance = config['training']['reward_weights'].get('balance', 5.0)
+        self.w_center = config['training']['reward_weights'].get('center', 1.5)
+
+        # === [V12.0 NEW] 势态权重策略 ===
+        self.w_gestalt_physics = config['training'].get('w_gestalt_physics', 8.0)
+        self.w_gestalt_smooth = config['training'].get('w_gestalt_smooth', 3.0)
+        self.w_gestalt_extreme = config['training'].get('w_gestalt_extreme', 5.0)
+        self.w_gestalt_sup = config['training'].get('w_gestalt_sup', 0.3)
 
         self.last_reward_stats = {}
         self.reward_history = []
         self.plot_path_reward = os.path.join(self.output_dir, "rl_reward_trajectory.png")
 
-        print(f"[RLTrainer V11.6] System Initialized.")
-        print(f" -> Gravity Target Y=0.75 (Objects Bottom, Space Top) | Weight: {self.w_balance}")
+        print(f"[RLTrainer V12.0] Gestalt Physics System Initialized.")
+        print(f" -> Layout: Gravity Y=0.75 (Bottom) | Weight: {self.w_balance}")
+        print(f" -> Gestalt: Physics Matching | Weight: {self.w_gestalt_physics}")
+        print(f" -> Gestalt: Smoothness | Weight: {self.w_gestalt_smooth}")
+        print(f" -> Gestalt: Extreme Penalty | Weight: {self.w_gestalt_extreme}")
 
     def compute_reward(self, dynamic_layout, batch, attention_maps=None):
         """
-        计算奖励：集成物理、热力图、斥力以及重力平衡系统
+        [V12.0 增强版] 计算奖励: 布局 (4D) + 势态 (4D)
         """
-        B, T, _ = dynamic_layout.shape
+        B, T, full_dim = dynamic_layout.shape
         device = dynamic_layout.device
         
-        pred_boxes = dynamic_layout[..., :4]
+        # === 解包布局和势态 ===
+        pred_boxes = dynamic_layout[..., :4]       # [B, T, 4]: [cx, cy, w, h]
+        pred_gestalt = dynamic_layout[..., 4:8]    # [B, T, 4]: [bias_x, bias_y, rotation, flow]
+        
         loss_mask = batch['loss_mask']          
         target_boxes = batch['target_boxes'][..., :4] 
         kg_spatial_matrix = batch.get('kg_spatial_matrix')
         kg_class_ids = batch['kg_class_ids']    
         
         obj_rewards = torch.zeros(B, T, device=device)
+        
+        # ========== 布局奖励 (保持不变) ==========
         
         # 1. 物理大小
         r_physics = self._calculate_physics_size_reward(pred_boxes, kg_class_ids) * self.w_physics
@@ -100,9 +159,7 @@ class RLTrainer(LayoutTrainer):
         r_bound = self._calculate_boundary_penalty(pred_boxes) * self.w_bound
         
         # 6. [重力系统]
-        # 垂直重力：把物体拉到 Y=0.75 (底部)，从而在顶部留白
         r_balance = self._calculate_vertical_balance_reward(pred_boxes, loss_mask) * self.w_balance
-        # 水平居中：防止贴边
         r_center = self._calculate_horizontal_centering_reward(pred_boxes) * self.w_center
 
         # 7. 重叠惩罚
@@ -110,10 +167,27 @@ class RLTrainer(LayoutTrainer):
         r_over = overlap_penalty * self.w_overlap 
         veto_factor = (1.0 - overlap_penalty * 5.0).clamp(min=0.0)
         
-        # --- 汇总 ---
-        obj_rewards += (r_physics + r_align + r_balance + r_center) 
-        obj_rewards += (r_iou + r_hm_size + r_rel + r_disp) * veto_factor
-        obj_rewards += r_bound 
+        # ========== [V12.0 NEW] 势态奖励 ==========
+        
+        # 8. 势态物理匹配 (核心!)
+        r_gestalt_phy = self._calculate_gestalt_physics_reward(
+            pred_gestalt, kg_class_ids, loss_mask
+        ) * self.w_gestalt_physics
+        
+        # 9. 势态空间平滑
+        r_gestalt_smooth = self._calculate_gestalt_smoothness_reward(
+            pred_gestalt, pred_boxes, loss_mask
+        ) * self.w_gestalt_smooth
+        
+        # 10. 势态极值惩罚
+        r_gestalt_extreme = self._calculate_gestalt_extreme_penalty(
+            pred_gestalt, loss_mask
+        ) * self.w_gestalt_extreme
+        
+        # --- 汇总 (基础奖励 + 势态奖励) ---
+        obj_rewards += (r_physics + r_align + r_balance + r_center + r_gestalt_phy) 
+        obj_rewards += (r_iou + r_hm_size + r_rel + r_disp + r_gestalt_smooth) * veto_factor
+        obj_rewards += r_bound + r_gestalt_extreme
         obj_rewards += r_over 
 
         self.last_reward_stats = {
@@ -122,6 +196,9 @@ class RLTrainer(LayoutTrainer):
             'Disp': r_disp.mean().item(),
             'Bal': r_balance.mean().item(), 
             'Over': r_over.mean().item(),
+            'G_Phy': r_gestalt_phy.mean().item(),      # [NEW]
+            'G_Smo': r_gestalt_smooth.mean().item(),   # [NEW]
+            'G_Ext': r_gestalt_extreme.mean().item(),  # [NEW]
         }
 
         valid_count = loss_mask.sum(dim=1).clamp(min=1.0)
@@ -156,33 +233,50 @@ class RLTrainer(LayoutTrainer):
             norm_adv = (raw_adv - raw_adv.mean()) / (std + 1e-8) if std > 1e-6 else raw_adv
             final_adv = norm_adv * torch.where(norm_adv > 0, self.success_scale, self.failure_scale)
             
-            # === [CRITICAL FIX] ===
-            # s_out[1] shape: [Batch, Time] (e.g., 128, 7)
-            # final_adv shape: [Batch] (e.g., 128)
-            # 必须先将 log_prob 在时间维度求和，得到整句话的 log_prob，再乘 advantage
-            
-            # 1. Sum log_probs over sequence (dim=1) -> [Batch]
-            seq_log_prob = s_out[1].sum(dim=1)
-            
-            # 2. Calculate Policy Gradient Loss -> [Batch] -> scalar
+            # === [V11.6 FIX] 维度修复 ===
+            seq_log_prob = s_out[1].sum(dim=1)  # [B, T] -> [B]
             rl_loss = -(seq_log_prob * final_adv).mean()
-            # ======================
             
-            # Auxiliary Loss
+            # === [V12.0 NEW] 势态监督损失 (辅助) ===
             if step % 5 == 0:
-                mu, logvar, dynamic_layout_sup, decoder_output, _ = self.model(
+                mu, logvar, dynamic_layout_sup, decoder_output, _, aux_outputs = self.model(
                     batch['input_ids'], batch['attention_mask'], batch['kg_class_ids'], 
                     batch['padding_mask'], batch.get('kg_spatial_matrix'), batch.get('location_grids'),
                     target_boxes=batch['target_boxes']
                 )
+                
+                # 原有损失 (布局监督)
                 loss_tuple = self.model.get_loss(
                     pred_cls=None, pred_bbox_ids=None, pred_boxes=dynamic_layout_sup, 
                     pred_count=None, layout_seq=None, layout_mask=batch['loss_mask'], 
                     num_boxes=batch['num_boxes'], target_coords_gt=batch['target_boxes'],
                     kg_spatial_matrix=batch.get('kg_spatial_matrix'), kg_class_weights=batch.get('kg_class_weights'),
-                    kg_class_ids=batch['kg_class_ids'], decoder_output=decoder_output, gestalt_mask=batch.get('gestalt_mask') 
+                    kg_class_ids=batch['kg_class_ids'], decoder_output=decoder_output, 
+                    gestalt_mask=batch.get('gestalt_mask'), aux_outputs=aux_outputs
                 )
-                total_combined_loss = rl_loss + 0.2 * (loss_tuple[0] + (compute_kl_loss(mu, logvar) if mu is not None else 0.0))
+                
+                # === [NEW] 势态监督损失 ===
+                pred_gestalt_sup = dynamic_layout_sup[..., 4:8]  # [B, T, 4]
+                target_gestalt = batch['target_boxes'][..., 4:8]  # [B, T, 4] from image
+                gestalt_mask = batch.get('gestalt_mask')  # [B, T] validity
+                
+                if gestalt_mask is not None:
+                    # 仅在有效区域计算势态损失
+                    valid_mask = batch['loss_mask'] * gestalt_mask  # [B, T]
+                    gestalt_loss = F.smooth_l1_loss(
+                        pred_gestalt_sup, target_gestalt, reduction='none'
+                    ) * valid_mask.unsqueeze(-1)  # [B, T, 4] * [B, T, 1]
+                    
+                    gestalt_loss = gestalt_loss.sum() / (valid_mask.sum().clamp(min=1.0) * 4.0)
+                else:
+                    gestalt_loss = 0.0
+                
+                # 组合损失
+                total_combined_loss = (
+                    rl_loss + 
+                    0.2 * (loss_tuple[0] + (compute_kl_loss(mu, logvar) if mu is not None else 0.0)) +
+                    self.w_gestalt_sup * gestalt_loss  # [NEW] 防止势态漂移
+                )
             else:
                 total_combined_loss = rl_loss
 
@@ -195,7 +289,9 @@ class RLTrainer(LayoutTrainer):
             steps += 1
             if (step + 1) % 10 == 0:
                 s = self.last_reward_stats
-                print(f"[Step {step+1}] R:{reward_sample.mean().item():.2f} | Phy:{s.get('Phy',0):.2f} | Bal:{s.get('Bal',0):.2f} | Over:{s.get('Over',0):.2f}")
+                print(f"[Step {step+1}] R:{reward_sample.mean().item():.2f} | "
+                      f"Phy:{s.get('Phy',0):.2f} | Bal:{s.get('Bal',0):.2f} | Over:{s.get('Over',0):.2f} | "
+                      f"G_Phy:{s.get('G_Phy',0):.2f} | G_Smo:{s.get('G_Smo',0):.2f}")
 
         # Plotting
         avg_reward = total_reward / steps
@@ -203,7 +299,135 @@ class RLTrainer(LayoutTrainer):
         self._plot_reward_history()
         return avg_reward
 
-    # ================= 辅助函数 =================
+    # ================= [V12.0 NEW] 势态奖励函数 =================
+    
+    def _calculate_gestalt_physics_reward(self, pred_gestalt, kg_class_ids, mask):
+        """
+        [核心功能] 类别-势态物理匹配奖励
+        
+        工作原理:
+        1. 根据 GESTALT_PRIORS 定义的先验知识
+        2. 检查每个物体的势态是否符合其类别的物理特性
+        3. 例: water(cls=3) 的 flow 应该在 [0.3, 0.9]
+        """
+        B, T, _ = pred_gestalt.shape
+        device = pred_gestalt.device
+        rewards = torch.zeros(B, T, device=device)
+        
+        # 解包势态参数
+        bias_x = pred_gestalt[..., 0]   # [-1, 1]
+        bias_y = pred_gestalt[..., 1]
+        rotation = pred_gestalt[..., 2]
+        flow = pred_gestalt[..., 3]
+        
+        for b in range(B):
+            for t in range(T):
+                if mask[b, t] < 0.5:
+                    continue
+                
+                cls_id = kg_class_ids[b, t].item()
+                if cls_id not in GESTALT_PRIORS:
+                    rewards[b, t] = 0.5  # 无约束类别给基础分
+                    continue
+                
+                priors = GESTALT_PRIORS[cls_id]
+                score = 0.0
+                count = 0
+                
+                # 检查每个参数
+                for param_name, (target, tolerance) in priors.items():
+                    if param_name == 'flow':
+                        value = flow[b, t].item()
+                    elif param_name == 'rotation':
+                        value = rotation[b, t].item()
+                    elif param_name == 'bias_x':
+                        value = bias_x[b, t].item()
+                    elif param_name == 'bias_y':
+                        value = bias_y[b, t].item()
+                    else:
+                        continue
+                    
+                    # 高斯奖励: 在 [target±tolerance] 内得高分
+                    deviation = abs(value - target)
+                    if deviation <= tolerance:
+                        score += 1.0
+                    else:
+                        # 超出范围指数衰减
+                        score += np.exp(-2.0 * ((deviation - tolerance) ** 2))
+                    count += 1
+                
+                rewards[b, t] = score / count if count > 0 else 0.5
+        
+        return rewards
+    
+    def _calculate_gestalt_smoothness_reward(self, pred_gestalt, pred_boxes, mask):
+        """
+        空间平滑性奖励: 相邻物体的势态应该连续变化
+        
+        物理直觉:
+        - 连续的山脉, rotation 应该逐渐变化
+        - 河流的 flow 应该保持一致
+        - 树林的 bias 应该有统一风向
+        """
+        B, T, _ = pred_gestalt.shape
+        device = pred_gestalt.device
+        rewards = torch.zeros(B, T, device=device)
+        
+        for b in range(B):
+            valid_indices = torch.nonzero(mask[b] > 0.5).squeeze(1)
+            if len(valid_indices) < 2:
+                continue
+            
+            for i in range(len(valid_indices) - 1):
+                idx_a = valid_indices[i]
+                idx_b = valid_indices[i + 1]
+                
+                # 计算空间距离
+                box_a = pred_boxes[b, idx_a]
+                box_b = pred_boxes[b, idx_b]
+                dist = torch.sqrt(
+                    (box_a[0] - box_b[0])**2 + (box_a[1] - box_b[1])**2
+                ).item()
+                
+                # 只对邻近物体(dist<0.3)计算平滑性
+                if dist > 0.3:
+                    continue
+                
+                # 势态差异
+                gestalt_a = pred_gestalt[b, idx_a]
+                gestalt_b = pred_gestalt[b, idx_b]
+                gestalt_diff = torch.abs(gestalt_a - gestalt_b).mean().item()
+                
+                # 平滑奖励: 差异越小越好
+                smooth_score = np.exp(-3.0 * gestalt_diff)
+                rewards[b, idx_a] += smooth_score * 0.5
+                rewards[b, idx_b] += smooth_score * 0.5
+        
+        return torch.clamp(rewards, 0.0, 1.0)
+    
+    def _calculate_gestalt_extreme_penalty(self, pred_gestalt, mask):
+        """
+        极值惩罚: 防止势态参数爆炸到边界
+        
+        合理范围:
+        - bias_x/y: [-0.95, 0.95]
+        - rotation: [-0.95, 0.95]
+        - flow: [-1.0, 1.0]
+        """
+        # 计算超出合理范围的程度 (超过0.95就开始惩罚)
+        extreme_violation = torch.clamp(
+            torch.abs(pred_gestalt) - 0.95, min=0.0
+        )
+        
+        # 指数惩罚
+        penalty_per_dim = torch.exp(-5.0 * extreme_violation)
+        
+        # 平均所有维度
+        penalty = penalty_per_dim.mean(dim=-1)
+        
+        return penalty * mask
+
+    # ================= 布局辅助函数 (保持不变) =================
     
     def _calculate_relation_reward(self, pred_boxes, kg_spatial_matrix, kg_class_ids):
         """计算空间关系奖励 (Above/Below/Inside)"""
@@ -249,16 +473,11 @@ class RLTrainer(LayoutTrainer):
         return torch.clamp(rewards, max=1.0)
 
     def _calculate_vertical_balance_reward(self, pred_boxes, mask):
-        """
-        [Deep Gravity] 
-        目标重心设为 0.75 (3/4处，靠近底部)。
-        这样物体会沉底，留白自然就出现在顶部了。
-        """
+        """重力沉底 (Target Y=0.75)"""
         cy = pred_boxes[..., 1]
         weighted_sum_cy = (cy * mask).sum(dim=1)
         count = mask.sum(dim=1).clamp(min=1.0)
         mean_cy = weighted_sum_cy / count
-        # 惩罚系数 4.0，严厉打击任何飘在上面的布局
         return torch.exp(-4.0 * (mean_cy.unsqueeze(1) - 0.75) ** 2)
 
     def _calculate_horizontal_centering_reward(self, pred_boxes):
@@ -302,7 +521,6 @@ class RLTrainer(LayoutTrainer):
 
     def _calculate_boundary_penalty(self, pred_boxes):
         cx, cy = pred_boxes[..., 0], pred_boxes[..., 1]
-        # 放宽底部边界限制(0.98)，允许物体沉底
         pen = F.relu(0.05 - cx) + F.relu(cx - 0.95) + F.relu(0.05 - cy) + F.relu(cy - 0.98)
         return torch.clamp(pen * 5.0, max=2.0)
     
@@ -332,7 +550,7 @@ class RLTrainer(LayoutTrainer):
             plt.plot(self.reward_history, marker='o', color='b', label='Avg Reward')
             plt.xlabel('Epochs')
             plt.ylabel('Reward Value')
-            plt.title('RL Training Progress (Gravity Edition)')
+            plt.title('RL Training Progress (V12.0: Gestalt Enhanced)')
             plt.grid(True)
             plt.legend()
             plt.savefig(self.plot_path_reward)
